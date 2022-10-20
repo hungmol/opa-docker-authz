@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -33,14 +35,16 @@ import (
 // function. The AuthZReq function returns a response that indicates whether
 // the request should be allowed or denied.
 type DockerAuthZPlugin struct {
-	configFile    string
-	policyFile    string
-	allowPath     string
-	instanceID    string
-	skipPing      bool
-	quiet         bool
-	logOnlyDenied bool
-	opa           *sdk.OPA
+	configFile       string
+	policyFile       string
+	allowPath        string
+	instanceID       string
+	skipPing         bool
+	quiet            bool
+	logOnlyDenied    bool
+	notifyServerAddr string // prdcv
+	deniedLogs       []byte //prdcv
+	opa              *sdk.OPA
 }
 
 // AuthZReq is called when the Docker daemon receives an API request. AuthZReq
@@ -63,7 +67,34 @@ func (p DockerAuthZPlugin) AuthZReq(r authorization.Request) authorization.Respo
 
 // AuthZRes is called before the Docker daemon returns an API response. All responses
 // are allowed.
-func (DockerAuthZPlugin) AuthZRes(authorization.Request) authorization.Response {
+func (DockerAuthZPlugin) AuthZRes(r authorization.Request) authorization.Response {
+
+	// PRDCV implement here to print the response part inside the Request
+	var body interface{}
+	if r.ResponseHeaders["Content-Type"] == "application/json" && len(r.ResponseBody) > 0 {
+		if err := json.Unmarshal(r.ResponseBody, &body); err != nil {
+			fmt.Println("Error when parsing response in request")
+		} else {
+			// Care about:
+			// 1. ResponseStatusCode
+			// 2. ResponseBody
+			// 3. ResponseHeaders
+			fmt.Println("=============== Start the response body")
+			output_response := map[string]interface{}{
+				"ResponseHeader": r.ResponseHeaders,
+				"ResponseCode":   r.ResponseStatusCode,
+				"Body":           body,
+			}
+			op, _ := json.Marshal(output_response)
+			log.Printf("%s\n", string(op))
+			fmt.Println("=============== End of the response body")
+		}
+	} else {
+		bodyString := string(r.ResponseBody)
+		log.Printf(bodyString)
+	}
+
+	//
 	return authorization.Response{Allow: true}
 }
 
@@ -128,14 +159,31 @@ func (p DockerAuthZPlugin) evaluatePolicyFile(ctx context.Context, r authorizati
 		"timestamp":   time.Now().Format(time.RFC3339Nano),
 	}
 
+	// PRDCV add start
+	decisionLog["OPA_decision"] = allowed
+	// PRDCV add end
+
 	if err != nil {
 		i, _ := json.Marshal(input)
+		// PRDCV added start
+		decisionLog["Error"] = err
+		p.deniedLogs, _ = json.Marshal(decisionLog)
+		// PRDCV add end here
+
 		log.Printf("Returning OPA policy decision: %v (error: %v; input: %v)", allowed, err, i)
+		p.sendErrorMessage()
 	} else {
 		if !p.quiet {
 			if !(p.logOnlyDenied && allowed) {
-				dl, _ := json.Marshal(decisionLog)
+				// PRDCV added start here
+				decisionLog["Error"] = nil
+				p.deniedLogs, _ = json.Marshal(decisionLog)
+				dl := p.deniedLogs
+				// PRDCV add end here
+
+				// dl, _ := json.Marshal(decisionLog)
 				log.Printf("Returning OPA policy decision: %v: %s", allowed, string(dl))
+				p.sendErrorMessage()
 			}
 		}
 	}
@@ -277,6 +325,37 @@ func normalizeAllowPath(path string, useConfig bool) string {
 	return path
 }
 
+//	++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ //
+//
+// Add by PRDCV
+// To-do: send https request
+func (p DockerAuthZPlugin) sendErrorMessage() error {
+	responseBody := bytes.NewBuffer(p.deniedLogs)
+	//Leverage Go's HTTP Post function to make request
+	resp, err := http.Post(
+		p.notifyServerAddr,
+		"application/json",
+		responseBody,
+	)
+	//Handle Error
+	if err != nil {
+		// log.Fatalf("An Error Occured %v", err)
+		log.Printf("[WARN] An Error Occured in HTTP Sever: %v", err)
+		return err // exit function
+	}
+	defer resp.Body.Close()
+	//Read the response body
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		// log.Fatalln(err)
+		log.Printf("[WARN] %v", err)
+		return err
+	}
+	sb := string(body)
+	log.Printf(sb)
+	return nil
+}
+
 func main() {
 
 	pluginName := flag.String("plugin-name", "opa-docker-authz", "sets the plugin name that will be registered with Docker")
@@ -288,6 +367,7 @@ func main() {
 	check := flag.Bool("check", false, "checks the syntax of the policy-file")
 	quiet := flag.Bool("quiet", false, "disable logging of each HTTP request (policy-file mode)")
 	logOnlyDenied := flag.Bool("log-only-denied", false, "only log denied requests (policy-file mode)")
+	notifyServerAddr := flag.String("notify-server-addr", "http://localhost:8001", "sets the receive notification server from this plugin")
 
 	flag.Parse()
 
@@ -316,14 +396,15 @@ func main() {
 
 	instanceID, _ := uuid4()
 	p := DockerAuthZPlugin{
-		configFile:    *configFile,
-		policyFile:    *policyFile,
-		allowPath:     normalizeAllowPath(*allowPath, useConfig),
-		instanceID:    instanceID,
-		skipPing:      *skipPing,
-		quiet:         *quiet,
-		logOnlyDenied: *logOnlyDenied,
-		opa:           opa,
+		configFile:       *configFile,
+		policyFile:       *policyFile,
+		allowPath:        normalizeAllowPath(*allowPath, useConfig),
+		instanceID:       instanceID,
+		skipPing:         *skipPing,
+		quiet:            *quiet,
+		logOnlyDenied:    *logOnlyDenied,
+		notifyServerAddr: *notifyServerAddr,
+		opa:              opa,
 	}
 
 	if *check && *policyFile != "" {
